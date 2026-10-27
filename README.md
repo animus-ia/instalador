@@ -28,6 +28,6 @@ Quem cria ou altera skills instala também a cópia de edição do `animus-plugi
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/animus-ia/instalador/main/instalar-plugins.sh)"
 ```
 
-Ela fica em `~/IA/animus-plugins`. Rascunhos ficam em `_rascunhos/` e nunca são publicados. A publicação acontece quando o arquivo `.publicar` aparece na pasta: em até 5 minutos a rotina valida (formato dos arquivos e versão nova em todo plugin alterado), publica com a mensagem escrita nesse arquivo e grava o resultado em `.publicacao.log`. Quem só usa as skills não precisa disto.
+Ela fica em `~/IA/animus-plugins`. Rascunhos ficam em `_rascunhos/` e nunca são publicados. A publicação acontece quando o arquivo `.publicar` aparece na pasta: em até 5 minutos a rotina abre uma proposta (pull request) no `animus-plugins` com a mensagem escrita nesse arquivo; a automação do repositório valida e publica sozinha, e a rotina grava o resultado em `.publicacao.log`. Quem só usa as skills não precisa disto.
 
 Este repositório é público e não guarda senha, token nem dado da empresa: só os passos de instalação.

@@ -7,8 +7,10 @@
 #
 # Como a publicação funciona depois de instalado:
 #   - A cada 5 minutos a rotina traz as mudanças publicadas por outras pessoas.
-#   - Quando existe o arquivo .publicar na pasta, ela valida, publica no GitHub com a
-#     mensagem escrita nesse arquivo, grava o resultado em .publicacao.log e apaga o sinal.
+#   - Quando existe o arquivo .publicar na pasta, ela abre uma proposta (pull request) no GitHub
+#     com a mensagem escrita nesse arquivo. A automação do repositório valida e publica sozinha.
+#   - Nas rodadas seguintes a rotina confere a proposta e grava o resultado em .publicacao.log:
+#     AGUARDANDO, PUBLICADO, RECUSADO (com o motivo) ou AGUARDANDO APROVAÇÃO (mudança na automação).
 #   - _rascunhos/, .publicar e .publicacao.log nunca são publicados.
 
 set -u
@@ -19,8 +21,6 @@ DIR="$HOME/IA/$REPO"
 BIN="$HOME/.local/bin"
 SCRIPTS="$HOME/Scripts"
 SCRIPT="$SCRIPTS/$REPO-publicar.sh"
-VALIDADOR="$SCRIPTS/$REPO-validar.py"
-VALIDADOR_URL="https://raw.githubusercontent.com/animus-ia/instalador/main/validar-plugins.py"
 LABEL="com.animus.$REPO-publicar"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 LOG="$HOME/Library/Logs/$REPO-publicar.log"
@@ -32,7 +32,7 @@ falha() { printf '\n\033[31mParou aqui:\033[0m %s\n' "$1"; printf 'Mande um prin
 [ "$(uname)" = "Darwin" ] || falha "este instalador é para Mac."
 export PATH="$BIN:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
-# 1. Git e Python (vêm com as Ferramentas de Linha de Comando da Apple)
+# 1. Git (vem com as Ferramentas de Linha de Comando da Apple)
 passo "1/5 · Git"
 if xcode-select -p >/dev/null 2>&1 && /usr/bin/git --version >/dev/null 2>&1; then
   ok "já instalado"
@@ -46,7 +46,6 @@ else
   done
   ok "instalado"
 fi
-/usr/bin/python3 -c 'import json' >/dev/null 2>&1 || falha "o Python da Apple não está disponível; rode de novo depois de terminar a instalação das Ferramentas da Apple."
 
 # 2. GitHub CLI (gh), sem precisar de Homebrew nem de senha do Mac
 passo "2/5 · Ferramenta do GitHub"
@@ -106,42 +105,87 @@ ok "assinando as publicações como $nome"
 # 5. Rotina de publicação
 passo "5/5 · Rotina de publicação"
 mkdir -p "$SCRIPTS" "$(dirname "$PLIST")" "$(dirname "$LOG")"
-curl -fsSL "$VALIDADOR_URL" -o "$VALIDADOR" || falha "não consegui baixar o validador."
+rm -f "$SCRIPTS/$REPO-validar.py"  # validador local da primeira versão: a validação agora é só a do GitHub
 
 cat > "$SCRIPT" <<EOF
 #!/bin/bash
-# Traz as mudanças dos outros e publica quando houver o sinal .publicar. Criado pelo instalador do $REPO.
+# Traz as mudanças dos outros e, com o sinal .publicar, abre a proposta no GitHub e acompanha
+# até a automação do repositório publicar. Criado pelo instalador do $REPO.
 export PATH="$BIN:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 DIR="$DIR"
+SLUG="$ORG/$REPO"
 RES="\$DIR/.publicacao.log"
+PENDENTE="\$DIR/.git/publicacao-pendente"
 exec >> "$LOG" 2>&1
 echo "----- \$(date '+%Y-%m-%d %H:%M:%S') -----"
 cd "\$DIR" 2>/dev/null || { echo "ERRO: pasta nao encontrada em \$DIR"; exit 1; }
 pgrep -x git >/dev/null 2>&1 || find .git -name '*.lock' -type f -delete 2>/dev/null
 
+grava() { printf '%s %s\n' "\$(date '+%Y-%m-%d %H:%M:%S')" "\$1" > "\$RES"; echo "\$1"; }
+desfaz_commit() {
+  # Devolve a mudança para a pasta como estava, sem publicar (só se o commit local ainda não está no GitHub).
+  git fetch -q origin main
+  [ "\$(git rev-list --count origin/main..HEAD)" -gt 0 ] && git reset -q --soft HEAD~1
+}
+
+# 1. Proposta aberta: acompanha até publicar ou ser recusada
+if [ -f "\$PENDENTE" ]; then
+  read -r pr ramo < "\$PENDENTE"
+  msg=\$(sed -n 2p "\$PENDENTE")
+  estado=\$(gh pr view "\$pr" -R "\$SLUG" --json state --jq .state 2>/dev/null)
+  case "\$estado" in
+    MERGED)
+      git pull --rebase --autostash -q origin main
+      git push -q origin --delete "\$ramo" 2>/dev/null
+      rm -f "\$PENDENTE"
+      grava "PUBLICADO: \$msg (proposta #\$pr)" ;;
+    CLOSED)
+      desfaz_commit; rm -f "\$PENDENTE"
+      grava "RECUSADO: a proposta #\$pr foi fechada sem publicar; a mudanca voltou para a pasta" ;;
+    OPEN)
+      checks=\$(gh pr view "\$pr" -R "\$SLUG" --json statusCheckRollup --jq '[.statusCheckRollup[] | (.conclusion // .status)] | join(" ")' 2>/dev/null)
+      if echo "\$checks" | grep -qE 'FAILURE|CANCELLED|TIMED_OUT|ERROR'; then
+        run=\$(gh run list -R "\$SLUG" --branch "\$ramo" -L 1 --json databaseId --jq '.[0].databaseId')
+        motivo=\$(gh run view "\$run" -R "\$SLUG" --log-failed 2>/dev/null | grep -E '  - ' | sed 's/.*  - //' | head -5 | paste -sd ';' -)
+        gh pr close "\$pr" -R "\$SLUG" --delete-branch >/dev/null 2>&1
+        desfaz_commit; rm -f "\$PENDENTE"
+        grava "RECUSADO pelo validador do GitHub: \${motivo:-ver a proposta #\$pr}; a mudanca voltou para a pasta"
+      elif [ -n "\$checks" ] && ! echo "\$checks" | grep -qE 'QUEUED|IN_PROGRESS|PENDING|WAITING|REQUESTED'; then
+        grava "AGUARDANDO APROVACAO: a proposta #\$pr passou na validacao mas precisa de aprovacao de uma pessoa (mexe na automacao): https://github.com/\$SLUG/pull/\$pr"
+      else
+        grava "AGUARDANDO: o GitHub esta validando a proposta #\$pr"
+      fi ;;
+    *) echo "AVISO: nao consegui consultar a proposta #\$pr" ;;
+  esac
+  exit 0
+fi
+
+# 2. Sem sinal: só traz as mudanças dos outros
 if [ ! -f .publicar ]; then
   git pull --rebase --autostash -q origin main && echo "atualizado" || echo "AVISO: nao consegui trazer as mudancas"
   exit 0
 fi
 
-resultado() {
-  printf '%s %s\n' "\$(date '+%Y-%m-%d %H:%M:%S')" "\$1" > "\$RES"
-  echo "\$1"; rm -f .publicar; exit 0
-}
-msg=\$(head -1 .publicar | tr -d '\r')
-[ -n "\$msg" ] || msg="Atualiza skills"
-git fetch -q origin main || resultado "ERRO: sem acesso ao GitHub; nada publicado"
-problemas=\$(/usr/bin/python3 "$VALIDADOR" "\$DIR")
-[ -z "\$problemas" ] || resultado "RECUSADO: \$(echo "\$problemas" | tr '\n' ';')"
+# 3. Sinal: abre a proposta
+msg=\$(head -1 .publicar | tr -d '\r'); [ -n "\$msg" ] || msg="Atualiza skills"
+rm -f .publicar
+git fetch -q origin main || { grava "ERRO: sem acesso ao GitHub; nada publicado, crie o sinal de novo"; exit 0; }
+git pull --rebase --autostash -q origin main || { grava "ERRO: alguem publicou mudanca no mesmo arquivo; resolver o conflito antes de publicar"; exit 0; }
 git add -A
-git diff --cached --quiet && resultado "NADA A PUBLICAR: nenhuma mudanca em relacao ao publicado"
-git commit -q -m "\$msg" || resultado "ERRO: nao consegui registrar a mudanca"
-if ! git pull --rebase -q origin main; then
-  git rebase --abort 2>/dev/null
-  git reset -q --soft HEAD~1
-  resultado "ERRO: alguem publicou mudanca no mesmo arquivo; nada publicado, resolver o conflito"
+git diff --cached --quiet && { grava "NADA A PUBLICAR: nenhuma mudanca em relacao ao publicado"; exit 0; }
+git commit -q -m "\$msg" || { grava "ERRO: nao consegui registrar a mudanca"; exit 0; }
+ramo="publicar/\$(date '+%Y%m%d-%H%M%S')-\$RANDOM"
+if ! git push -q origin "HEAD:refs/heads/\$ramo"; then
+  git reset -q --soft HEAD~1; grava "ERRO: envio ao GitHub falhou; nada publicado, crie o sinal de novo"; exit 0
 fi
-git push -q origin main && resultado "PUBLICADO: \$msg (\$(git rev-parse --short HEAD))" || resultado "ERRO: envio ao GitHub falhou; nada publicado"
+url=\$(gh pr create -R "\$SLUG" --base main --head "\$ramo" --title "\$msg" --body "Aberta pela rotina de publicacao de \$(git config user.name).")
+pr=\${url##*/}
+if [ -z "\$pr" ] || ! [ "\$pr" -eq "\$pr" ] 2>/dev/null; then
+  git push -q origin --delete "\$ramo" 2>/dev/null; git reset -q --soft HEAD~1
+  grava "ERRO: nao consegui abrir a proposta no GitHub; nada publicado, crie o sinal de novo"; exit 0
+fi
+printf '%s %s\n%s\n' "\$pr" "\$ramo" "\$msg" > "\$PENDENTE"
+grava "AGUARDANDO: proposta #\$pr aberta; o GitHub valida e publica em instantes"
 EOF
 chmod +x "$SCRIPT"
 
@@ -164,11 +208,10 @@ plutil -lint "$PLIST" >/dev/null || falha "o agendamento ficou com erro de forma
 launchctl bootout "gui/$(id -u)/$LABEL" >/dev/null 2>&1
 launchctl bootstrap "gui/$(id -u)" "$PLIST" || falha "não consegui ligar o agendamento."
 
-# Teste: a rotina traz o publicado e o validador aprova o estado atual
+# Teste: a rotina traz o que está publicado
 /bin/bash "$SCRIPT"
 tail -1 "$LOG" | grep -q "atualizado" || falha "a rotina não conseguiu trazer as mudanças do GitHub. Última linha do registro: $(tail -1 "$LOG")"
-problemas=$(/usr/bin/python3 "$VALIDADOR" "$DIR")
-[ -z "$problemas" ] && ok "ligada e testada" || printf '  ⚠ ligada; o validador já aponta pendências no que está publicado:\n%s\n' "$problemas"
+ok "ligada e testada"
 
 printf '\n\033[32mPronto.\033[0m Para editar skills, conecte a pasta %s na conversa com o Claude.\n' "$DIR"
 printf 'Rascunhos ficam em _rascunhos/ e nunca são publicados. A publicação só acontece com aprovação.\n\n'
