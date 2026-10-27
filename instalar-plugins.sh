@@ -119,6 +119,13 @@ PENDENTE="\$DIR/.git/publicacao-pendente"
 exec >> "$LOG" 2>&1
 echo "----- \$(date '+%Y-%m-%d %H:%M:%S') -----"
 cd "\$DIR" 2>/dev/null || { echo "ERRO: pasta nao encontrada em \$DIR"; exit 1; }
+# Uma execucao por vez: o agendamento e um teste manual podem coincidir.
+TRAVA="\$DIR/.git/rotina.trava"
+if ! mkdir "\$TRAVA" 2>/dev/null; then
+  if [ -n "\$(find "\$TRAVA" -maxdepth 0 -mmin +10 2>/dev/null)" ]; then rmdir "\$TRAVA"; mkdir "\$TRAVA" || exit 0
+  else echo "outra execucao em andamento"; exit 0; fi
+fi
+trap 'rmdir "\$TRAVA" 2>/dev/null' EXIT
 pgrep -x git >/dev/null 2>&1 || find .git -name '*.lock' -type f -delete 2>/dev/null
 
 grava() { printf '%s %s\n' "\$(date '+%Y-%m-%d %H:%M:%S')" "\$1" > "\$RES"; echo "\$1"; }
@@ -209,6 +216,9 @@ launchctl bootout "gui/$(id -u)/$LABEL" >/dev/null 2>&1
 launchctl bootstrap "gui/$(id -u)" "$PLIST" || falha "não consegui ligar o agendamento."
 
 # Teste: a rotina traz o que está publicado
+TRAVA_TESTE="$DIR/.git/rotina.trava"
+# Espera a primeira execução do agendamento terminar antes do teste.
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do [ -d "$TRAVA_TESTE" ] || break; sleep 5; done
 /bin/bash "$SCRIPT"
 tail -1 "$LOG" | grep -q "atualizado" || falha "a rotina não conseguiu trazer as mudanças do GitHub. Última linha do registro: $(tail -1 "$LOG")"
 ok "ligada e testada"

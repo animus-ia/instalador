@@ -99,6 +99,14 @@ export PATH="$BIN:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 exec >> "$LOG" 2>&1
 echo "----- \$(date '+%Y-%m-%d %H:%M:%S') -----"
 cd "$VAULT" 2>/dev/null || { echo "ERRO: vault nao encontrado em $VAULT"; exit 1; }
+DIR="$VAULT"
+# Uma execucao por vez: o agendamento e um teste manual podem coincidir.
+TRAVA="\$DIR/.git/rotina.trava"
+if ! mkdir "\$TRAVA" 2>/dev/null; then
+  if [ -n "\$(find "\$TRAVA" -maxdepth 0 -mmin +10 2>/dev/null)" ]; then rmdir "\$TRAVA"; mkdir "\$TRAVA" || exit 0
+  else echo "outra execucao em andamento"; exit 0; fi
+fi
+trap 'rmdir "\$TRAVA" 2>/dev/null' EXIT
 # Trava esquecida por um git que morreu impede o commit; so remove se nenhum git estiver rodando.
 pgrep -x git >/dev/null 2>&1 || find .git -name '*.lock' -type f -delete 2>/dev/null
 git add -A
@@ -129,6 +137,9 @@ launchctl bootstrap "gui/$(id -u)" "$PLIST" || falha "não consegui ligar o agen
 ok "ligada"
 
 # Teste: uma nota sobe para o GitHub e depois é apagada
+TRAVA_TESTE="$VAULT/.git/rotina.trava"
+# Espera a primeira execução do agendamento terminar antes do teste.
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do [ -d "$TRAVA_TESTE" ] || break; sleep 5; done
 printf '  Testando...\n'
 login=$(gh api user --jq .login)
 nota="_teste-sync-$login.md"
